@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use godot::engine::utilities::minf;
+use godot::engine::utilities::move_toward;
 use godot::engine::ProjectSettings;
 use godot::prelude::*;
 use godot::engine::Node;
@@ -8,17 +9,26 @@ use godot::engine::Node2D;
 use godot::engine::INode2D;
 use godot::engine::AnimationPlayer;
 
+use crate::game_manager::GameTick;
 use crate::input_controller::InputController;
 use crate::gui_player_state::GUIPlayerState;
 use crate::game_manager::GAME_TICK;
+
+const MAX_SPEED:f32 = 10.0;
+const ACCELERATION_SPEED:f32 = MAX_SPEED * 6.0;
+const DECELERATION_SPEED:f32 = MAX_SPEED * 6.0;
+const JUMP_VELOCITY:f32 = -30.0; 
+const TERMINAL_VELOCITY:f32 = 700.0;
+const GRAVITY:f32 = 100.0;
+
+const ROLLBACK_TICKS:u64 = 30;
 
 #[derive(GodotClass)]
 #[class(base=Node2D)]
 pub struct Player {
     pub id: Option<u8>,
-    input_of_tick: HashMap<u64, u8>,
-    input_ok: HashMap<u64, bool>,
-    speed: f64,
+    pub real_inputs: [Option<u8>; 30],
+    pub predicted_inputs: [u8; 30],
     vel: Vector2,
     animation_player: Option<Gd<AnimationPlayer>>,
     base: Base<Node2D>
@@ -35,34 +45,78 @@ impl Player {
         }
     }
 
-    #[func]
-    pub fn push_input(&mut self, input: u8, tick: u64) {
-        self.input_of_tick.insert(tick, input);
-        self.input_ok.insert(tick, false);
-    }
-
-    #[func]
-    pub fn push_input_ok(&mut self, tick: u64) {
-        self.input_ok.get_mut(&tick).map(|x| *x = true);
-    }
-
-    pub fn get_input_5(&mut self, tick: u64) -> [(u64, u8); 5] {
-        let mut index = 0;
-        let mut inputs = [(0u64, 0u8); 5];
-        let mut index_counter = 0;
-        //저장된 인풋들 중 최근 5개의 인풋을 반환
-        while tick - index > 0 {
-            if let Some(x) = self.input_of_tick.get(&(tick - index)) {
-                inputs[index_counter] = (tick - index, *x);
-                index_counter += 1;
-
-                if index_counter == 5 {
-                    break;
-                }
-            }
-            index += 1;
+    pub fn push_input(&mut self, input: u8) {
+        let mut inputs = self.real_inputs;
+        for i in 0..inputs.len() - 1 {
+            inputs[i] = inputs[i + 1];
         }
-        inputs
+        inputs[inputs.len() - 1] = Some(input);
+        self.real_inputs = inputs;
+    }
+
+    pub fn load_input(&self, tick: u64) -> u8 {
+
+        let cur_tick = GAME_TICK.lock().unwrap().tick;
+        if (cur_tick - tick) > 29 {
+            panic!("Trying to load input from the future tick : {}, ctick : {}", tick, cur_tick);
+        }
+
+        let index = 29 - (cur_tick - tick) as usize;
+
+        if self.real_inputs[index].is_some() {
+            return self.real_inputs[index].unwrap();
+        } 
+        return self.predicted_inputs[index];
+    }
+
+    pub fn simulated_tick(&mut self, tick: u64, delta: f64) {
+        let mut velocity = self.vel;
+
+        let cur_tick = GAME_TICK.lock().unwrap().tick;
+        
+        let current_pos = self.to_gd().get_position();
+        let can_jump = current_pos.y == -5.0;
+        let input_controller = self.base().get_tree().unwrap().get_root().unwrap().get_node_as::<InputController>("Root/InputController");
+
+        let mut jump = false;
+
+        let mut dir = 0;
+        if cur_tick > 0 {
+            let input = self.load_input(tick);
+
+            dir += (input & 0b0001 == 0b0001) as i32;
+            dir -= (input & 0b0010 == 0b0010) as i32;
+
+            jump = input & 0b0100 == 0b0100;
+        } else {
+            let input = input_controller.bind().local_input;
+            dir += (input & 0b0001 == 0b0001) as i32;
+            dir -= (input & 0b0010 == 0b0010) as i32;
+            jump = input & 0b0100 == 0b0100;
+        }
+
+	    if jump && can_jump {
+	    	velocity.y = JUMP_VELOCITY;
+        }
+
+        let mut anim = self.animation_player.clone().unwrap();
+        anim.set_current_animation(if dir != 0 {"anim/run"} else {"anim/idle"}.into());
+        anim.play();
+        
+        let acc:f64 = if dir == 0 {DECELERATION_SPEED} else {ACCELERATION_SPEED} as f64;
+
+        velocity.x = move_toward(velocity.x as f64, (dir as f32 * MAX_SPEED) as f64, delta * acc) as f32;
+        velocity.y = minf(TERMINAL_VELOCITY as f64, (velocity.y + GRAVITY * delta as f32) as f64) as f32;
+
+        let mut new_position = current_pos + velocity;
+        new_position.y = new_position.y.min(-5.0);
+        self.to_gd().set_position(new_position);
+        
+        if velocity.x != 0.0 {
+            self.to_gd().set_scale(Vector2::new(velocity.x.signum(), 1.0));
+        }
+
+        self.vel = velocity;
     }
 }
 
@@ -71,9 +125,8 @@ impl INode2D for Player {
     fn init(base: Base<Node2D>) -> Self {
         Self {
             id: None,
-            input_of_tick: HashMap::new(),
-            input_ok: HashMap::new(),
-            speed: 400.0,
+            real_inputs: [None; 30],
+            predicted_inputs: [0; 30],
             vel: Vector2::new(0.0, 0.0),
             animation_player: None,
             base,
@@ -89,66 +142,5 @@ impl INode2D for Player {
         self.base_mut().call_deferred("set_gui".into(), &[]);
     }
     
-    fn physics_process(&mut self, delta: f64) {
-        let mut velocity = self.vel;
-
-        let net_stat = GAME_TICK.lock().unwrap();
-        let current_pos = self.to_gd().get_position();
-        let can_jump = current_pos.y == -5.0;
-        let mut jump = false;
-
-        if (*net_stat).tick > 0 {
-            let tick = (*net_stat).tick;
-
-            let mut input = 0u8;
-            if self.input_of_tick.contains_key(&tick) && *self.input_ok.get(&tick).unwrap() {
-                input = *self.input_of_tick.get(&tick).unwrap();
-                self.input_of_tick.remove(&tick);
-            }
-            velocity.x += if input & 0b0001 == 0b0001 { 1.0 } else { 0.0 };
-            velocity.x -= if input & 0b0010 == 0b0010 { 1.0 } else { 0.0 };
-            jump = input & 0b0100 == 0b0100;
-        } else {
-            let input_controller = self.base().get_tree().unwrap().get_root().unwrap().get_node_as::<InputController>("Root/InputController");
-            let input = input_controller.bind().local_input;
-            
-            velocity.x += if input & 0b0001 == 0b0001 { 1.0 } else { 0.0 };
-            velocity.x -= if input & 0b0010 == 0b0010 { 1.0 } else { 0.0 };
-            jump = input & 0b0100 == 0b0100;
-        }
-
-        let JUMP_VELOCITY = -30f32; //-725f32;
-        //Maximum speed at which the player can fall.
-        let TERMINAL_VELOCITY = 700f32;
-
-	    if jump && can_jump {
-	    	velocity.y = JUMP_VELOCITY;
-        }
-        
-        let gravity = 100f64;
-	    //Fall.
-	    velocity.y = minf(TERMINAL_VELOCITY as f64, velocity.y as f64 + gravity as f64 * delta) as f32;
-
-        if velocity.x.abs() > 0.0 {
-            velocity.x = velocity.x * delta as f32 * self.speed as f32;
-            let mut anim = self.animation_player.clone().unwrap();
-            anim.set_current_animation("anim/run".into());
-            anim.play();
-        } else {
-            let mut anim = self.animation_player.clone().unwrap();
-            anim.set_current_animation("anim/idle".into());
-            anim.play();
-        }
-
-        let mut new_position = current_pos + velocity;
-        new_position.y = new_position.y.min(-5.0);
-        self.to_gd().set_position(new_position);
-        
-        if velocity.x != 0.0 {
-            self.to_gd().set_scale(Vector2::new(velocity.x.signum(), 1.0));
-        }
-
-        self.vel = velocity;
-        self.vel.x = 0.0;
-    }
+    fn physics_process(&mut self, delta: f64) {}
 }

@@ -12,6 +12,7 @@ use godot::engine::RandomNumberGenerator;
 use godot::prelude::*;
 
 use crate::game_manager::GameTick;
+use crate::game_manager::GAME_TICK;
 use crate::gui_player_state::GUIPlayerState;
 use crate::player::Player;
 use crate::time;
@@ -63,6 +64,7 @@ impl NetworkController {
                 .flat_map(|v| v.iter())
                 .cloned()
                 .collect();
+
             send_bytes(
                 net_data.socket.as_ref(),
                 pks.as_slice(),
@@ -132,17 +134,21 @@ impl INode2D for NetworkController {
                 }
             }
         }));
+        
+        self.base_mut().set_physics_process_priority(-5);
 
         godot_print!("Network Controller Ready");
     }
 
-    fn physics_process(&mut self, _: f64) {
+    fn physics_process(&mut self, delta: f64) {
         let root_node = self.base().get_tree().unwrap().get_root().unwrap();
         let mut game_tick = root_node.get_node_as::<GameTick>("Root/GameTick");
         let mut root = self.base().get_node_as::<Node2D>("../");
         let mut player = root_node.get_node_as::<Player>("Root/Player");
         let mut other_player = root_node.try_get_node_as::<Player>("Root/OtherPlayer");
-
+        
+        let cur_tick = GAME_TICK.lock().unwrap().tick;
+        
         let net_data = self.net.as_mut().unwrap();
         let timestamp = time::get_ms_timestamp();
 
@@ -239,36 +245,74 @@ impl INode2D for NetworkController {
                         self.send_buffer.push(packet);
                     }
                     PacketType::Input => {
-                        let (input, _) =
+                        let (mut input, _) =
                             unpack::<udp_net::InputPacket>(&buffer[1..]).expect("Failed to unpack");
 
                         if let Some(other_player) = other_player.as_mut() {
                             let mut other_player = other_player.bind_mut();
-                            for i in 0..5 {
-                                other_player.push_input(input.input[i], input.tick[i]);
-                                other_player.push_input_ok(input.tick[i]);
+
+                            if cur_tick < input.tick {
+                                input.tick = cur_tick;
+                            }
+
+                            let end_index = 30 - (cur_tick - input.tick).min(30) as usize;
+                            
+
+                            let mut rollback_tick: Option<u64> = None;
+
+                            for i in 0..end_index {
+                                let other_input = input.inputs[i + 30 - end_index];
+                                other_player.real_inputs[i] = Some(other_input);
+
+                                if other_player.predicted_inputs[i] != other_input {
+                                    rollback_tick = Some(cur_tick - i as u64);
+                                }
+                            }
+                            for i in end_index..30 {
+                                other_player.real_inputs[i] = None;
+                            }
+
+                            let predicted_input = other_player.real_inputs.iter().filter(|x| x.is_some()).last().unwrap_or(&Some(0u8)).clone();
+                            other_player.predicted_inputs = other_player.real_inputs.clone().map(|x| x.unwrap_or(predicted_input.unwrap()));
+
+                            if let Some(rollback_tick) = rollback_tick {
+                                let mut ri = cur_tick;
+                                for _  in rollback_tick..cur_tick {
+                                    other_player.simulated_tick(ri, -delta);
+                                    ri -= 1;
+                                }
+                                for i in rollback_tick..cur_tick {
+                                    other_player.simulated_tick(i, delta);
+                                }
                             }
                         }
-
-                        let mut packet = udp_net::pack::<InputOKPacket>(
-                            &InputOKPacket { tick: input.tick },
-                            PacketType::InputOK,
-                        );
-                        packet.insert(0, (packet.len() + 1) as u8);
-                        self.send_buffer.push(packet);
+                        // let mut packet = udp_net::pack::<InputOKPacket>(
+                        //     &InputOKPacket { tick: input.tick },
+                        //     PacketType::InputOK,
+                        // );
+                        // packet.insert(0, (packet.len() + 1) as u8);
+                        // self.send_buffer.push(packet);
                     }
                     PacketType::InputOK => {
-                        let (input_ok, _) =
-                            unpack::<InputOKPacket>(&buffer[1..]).expect("Failed to unpack");
-
-                        for i in 0..5 {
-                            let mut local_player = player.bind_mut();
-                            local_player.push_input_ok(input_ok.tick[i]);
-                        }
+                        //let (input_ok, _) =
+                        //    unpack::<InputOKPacket>(&buffer[1..]).expect("Failed to unpack");
+                        //for i in 0..5 {
+                        //    let mut local_player = player.bind_mut();
+                        //    local_player.push_input_ok(input_ok.tick[i]);
+                        //}
                     }
                 }
             }
         }
+        
+        if let Some(other_player) = other_player.as_mut() {
+            let mut other_player = other_player.bind_mut();
+
+            //last input in real Some input 
+            other_player.simulated_tick(cur_tick, delta);
+        }
+
+        player.bind_mut().simulated_tick(cur_tick, delta);
     }
 
     fn process(&mut self, _: f64) {

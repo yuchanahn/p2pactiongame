@@ -43,12 +43,12 @@ pub struct Connect {
 }
 
 pub struct InputPacket {
-    pub input: [u8; 5],
-    pub tick: [u64; 5]
+    pub inputs: [u8; 30],
+    pub tick: u64,
 }
 
 pub struct InputOKPacket {
-    pub tick: [u64; 5]
+    pub tick: [u64; 30]
 }
 
 //Error Type for unpacking

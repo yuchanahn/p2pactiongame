@@ -37,10 +37,20 @@ impl INode2D for GameTick {
         }
     }
 
+    fn ready(&mut self) {
+        self.base_mut().set_physics_process_priority(-10);
+    }
+
     fn physics_process(&mut self, _delta: f64) {
-      if (self.game_start_time == 0) || self.game_start_time > time::get_ms_timestamp() {
-          return;
-      }
-      (*GAME_TICK.lock().unwrap()).tick += 1;
-  }
+        if (self.game_start_time == 0) || self.game_start_time > time::get_ms_timestamp() {
+            return;
+        }
+
+        let mut tick = GAME_TICK.lock().unwrap();
+
+        if tick.tick == 0 {
+            tick.tick = 30;
+        }
+        tick.tick += 1;
+    }
 }
