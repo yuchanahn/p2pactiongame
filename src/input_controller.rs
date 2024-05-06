@@ -74,6 +74,10 @@ impl INode2D for InputController {
             input2send |= 0b0100;
             key_str.push_str("w");
         }
+        if input.is_action_pressed("attack".into()) {
+            input2send |= 0b1000;
+            key_str.push_str("mouse1");
+        }
 
         self.gui_text_keypress
             .as_mut()
@@ -85,13 +89,6 @@ impl INode2D for InputController {
             });
 
         let mut nc = self.nc.as_mut().unwrap().bind_mut();
-        let nd = nc.net.as_mut().unwrap();
-        //let dt = 1000.0 / 60.0;
-        
-        //if input2send == 0 {
-        //    self.local_input = input2send;
-        //    return;
-        //}
 
         if tick <= 0 {
             self.local_input = input2send;

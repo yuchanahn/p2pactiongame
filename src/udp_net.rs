@@ -6,12 +6,14 @@ use godot::log::godot_print;
 
 
 #[repr(u8)]
+#[derive(Debug)]
 pub enum PacketType {
     Ping,
     Pong,
     Connect,
     Input,
     InputOK,
+    TimeSync
 }
 
 impl From<u8> for PacketType {
@@ -22,6 +24,7 @@ impl From<u8> for PacketType {
             2 => PacketType::Connect,
             3 => PacketType::Input,
             4 => PacketType::InputOK,
+            5 => PacketType::TimeSync,
             _ => panic!("Unknown packet type")
         }
     }
@@ -49,6 +52,10 @@ pub struct InputPacket {
 
 pub struct InputOKPacket {
     pub tick: [u64; 30]
+}
+
+pub struct TimeSync {
+    pub time: u64,
 }
 
 //Error Type for unpacking

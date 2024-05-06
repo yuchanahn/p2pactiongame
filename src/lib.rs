@@ -13,3 +13,6 @@ mod time;
 mod connect;
 mod input_controller;
 mod game_manager;
+mod shape_cast2d;
+mod effect;
+mod utils;

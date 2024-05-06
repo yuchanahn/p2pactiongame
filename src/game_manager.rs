@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use godot::engine::Node2D;
+use godot::engine::{Label, Node2D};
 use godot::prelude::*;
 
 use crate::time;
@@ -43,6 +43,17 @@ impl INode2D for GameTick {
 
     fn physics_process(&mut self, _delta: f64) {
         if (self.game_start_time == 0) || self.game_start_time > time::get_ms_timestamp() {
+            let mut label = self.base().get_node_as::<Label>("GameStartCount");
+            if self.game_start_time == 0 {
+                label.set_text("준비".into_godot());
+            } else {
+                let number = (self.game_start_time - time::get_ms_timestamp()) as f64 / 1000.0;
+                if number.round() > 0.0 {
+                    label.set_text(number.round().to_string().into_godot());
+                } else {
+                    label.set_text("".into_godot());
+                }
+            }
             return;
         }
 

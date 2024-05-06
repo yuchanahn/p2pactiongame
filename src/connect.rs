@@ -4,12 +4,17 @@ use godot::engine::Node2D;
 use godot::engine::TextEdit;
 use godot::prelude::*;
 
+use crate::game_manager::GameTick;
 use crate::game_manager::GAME_TICK;
 use crate::network_controller::NetworkController;
+use crate::network_controller::TIMESTAMP_FOR_TIMESYNC;
+use crate::network_controller::TIME_BASED;
 use crate::time;
 use crate::udp_net;
+use crate::udp_net::send_bytes;
 use crate::udp_net::Connect;
 use crate::udp_net::PacketType;
+use crate::udp_net::TimeSync;
 
 #[derive(GodotClass)]
 #[class(base=Node2D)]
@@ -78,13 +83,28 @@ impl INode2D for GUIConnect {
                         let input = Input::singleton();
                         if input.is_action_pressed("send_chat".into()) {
                           let text = text_edit.get_text().to_string().trim().to_string();
-                          let player = self.base().get_tree().unwrap().get_root().unwrap().get_node_as::<Node2D>("Root/Player");
+                          let mut player = self.base().get_tree().unwrap().get_root().unwrap().get_node_as::<Node2D>("Root/Player");
                           let pos = player.get_position();
                           
-                          let game_start_time = time::get_ms_timestamp() + 1000;
-                        
-                          let mut packet = udp_net::pack::<Connect>(&Connect { x: pos.x, y: pos.y, game_start_time }, PacketType::Connect);
+                          player.set_position(Vector2::new(393.0, pos.y));
+
+                          let game_start_time = time::get_ms_timestamp() + 3000;
+                          let mut game_tick = self.base().get_tree().unwrap().get_root().unwrap().get_node_as::<GameTick>("Root/GameTick");
+                          game_tick.bind_mut().game_start_time = game_start_time;
+
+                          let mut packet = udp_net::pack::<Connect>(&Connect { x: 393.0, y: pos.y, game_start_time }, PacketType::Connect);
                           packet.insert(0, (packet.len() + 1) as u8);
+                          
+                          *TIME_BASED.lock().unwrap() = true;
+                          *TIMESTAMP_FOR_TIMESYNC.lock().unwrap() = time::get_ms_timestamp();
+                          drop(TIMESTAMP_FOR_TIMESYNC.lock().unwrap());
+                          drop(TIME_BASED.lock().unwrap());
+                          
+                          let pkt: TimeSync = TimeSync { time: time::get_ms_timestamp() };
+                          let mut pkt = udp_net::pack::<TimeSync>(&pkt, PacketType::TimeSync);
+                          pkt .insert(0, (pkt .len() + 1) as u8);
+                          send_bytes(nc.bind().get_socket(), pkt .as_slice(), text.as_str());
+                        
                           nc.bind().send_to(packet.as_slice(), text.as_str());
                         
                           godot_print!("Sent connect packet to {}", text.as_str());
