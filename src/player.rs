@@ -11,11 +11,14 @@ use godot::prelude::*;
 use crate::effect::Effect;
 use crate::game_manager::GAME_TICK;
 use crate::gui_player_state::GUIPlayerState;
+use crate::input_controller::GameInput;
 use crate::input_controller::InputController;
+use crate::input_controller::INPUT_DELAY;
+use crate::input_controller::INPUT_SIZE;
 use crate::utils::minus;
 use crate::utils::plus;
 
-const MAX_SPEED: f32 = 10.0;
+const MAX_SPEED: f32 = 5.0;
 const ACCELERATION_SPEED: f32 = MAX_SPEED * 6.0;
 const DECELERATION_SPEED: f32 = MAX_SPEED * 6.0;
 const JUMP_VELOCITY: f32 = -30.0;
@@ -38,6 +41,9 @@ pub enum EAnim {
     Attack,
     Hit,
     Die,
+    Guard,
+    Attack2,
+    Roll,
 }
 
 impl From<&str> for EAnim {
@@ -50,6 +56,9 @@ impl From<&str> for EAnim {
             "attack" => EAnim::Attack,
             "hit" => EAnim::Hit,
             "die" => EAnim::Die,
+            "guard" => EAnim::Guard,
+            "attack2" => EAnim::Attack2,
+            "roll" => EAnim::Roll,
             _ => panic!("Unknown animation name"),
         }
     }
@@ -65,6 +74,9 @@ impl From<EAnim> for StringName {
             EAnim::Attack => "attack".into(),
             EAnim::Hit => "hit".into(),
             EAnim::Die => "die".into(),
+            EAnim::Guard => "guard".into(),
+            EAnim::Attack2 => "attack2".into(),
+            EAnim::Roll => "roll".into(),
         }
     }
 }
@@ -74,6 +86,28 @@ pub struct PlayAnimationData {
     pub name: EAnim,
     pub started_at: u64,
     pub looped: bool,
+}
+
+impl PlayAnimationData{
+    pub fn clac_fream(&self, tick: u64, anim: Gd<AnimatedSprite2D>) -> i32 {
+        let delta_tick = minus(tick, self.started_at);
+        let frame_speed = 3; // 0.1초
+        let frame_max = anim
+            .get_sprite_frames()
+            .as_mut()
+            .unwrap()
+            .get_frame_count(self.name.into());
+
+        if self.looped {
+            if delta_tick == 0 {
+                return 0;
+            } else {
+                return ((delta_tick / frame_speed) % frame_max as u64) as i32;
+            }
+        } else {
+            return (delta_tick / frame_speed).min(frame_max as u64) as i32;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,9 +128,10 @@ pub struct PlayerStat {
 #[class(base=Node2D)]
 pub struct Player {
     pub id: Option<u8>,
-    pub real_inputs: [Option<u8>; 30],
-    pub predicted_inputs: [u8; 30],
-    pub rollback_states: [Option<RollbackState>; 30],
+    
+    pub input: GameInput,
+    pub rollback_states: [Option<RollbackState>; INPUT_SIZE - INPUT_DELAY],
+
     pub attack_cooldown: f64,
     pub anim_data: Option<PlayAnimationData>,
     pub stat: PlayerStat,
@@ -121,19 +156,10 @@ impl Player {
         }
     }
 
-    pub fn push_input(&mut self, input: u8) {
-        let mut inputs = self.real_inputs;
-        for i in 0..inputs.len() - 1 {
-            inputs[i] = inputs[i + 1];
-        }
-        inputs[inputs.len() - 1] = Some(input);
-        self.real_inputs = inputs;
-    }
-
     pub fn push_rollback_state(&mut self, tick: u64) {
-        let index = 29 - (GAME_TICK.lock().unwrap().tick - tick) as usize;
+        let index = (INPUT_SIZE - 1) - (GAME_TICK.lock().unwrap().tick - tick) as usize;
 
-        self.rollback_states[index] = Some(RollbackState {
+        self.rollback_states[index - INPUT_DELAY] = Some(RollbackState {
             position: self.base().get_position(),
             velocity: self.vel,
             attack_cooldown: self.attack_cooldown,
@@ -144,33 +170,34 @@ impl Player {
 
     pub fn load_input(&self, tick: u64) -> u8 {
         let cur_tick = GAME_TICK.lock().unwrap().tick;
-        if (cur_tick - tick) > 29 {
+        if (cur_tick - tick) >= (INPUT_SIZE - INPUT_DELAY) as u64{
             panic!(
-                "Trying to load input from the future tick : {}, ctick : {}",
+                "Trying to load input fail {} / {}",
                 tick, cur_tick
             );
         }
 
-        let index = 29 - (cur_tick - tick) as usize;
+        let index = (INPUT_SIZE - 1) - (cur_tick - tick) as usize;
+        let index = index - INPUT_DELAY;
 
-        if self.real_inputs[index].is_some() {
-            return self.real_inputs[index].unwrap();
+        if self.input.real_inputs[index].is_some() {
+            return self.input.real_inputs[index].unwrap();
         }
-        return self.predicted_inputs[index];
+        return self.input.predicted_inputs[index];
     }
 
     pub fn restore_state(&mut self, tick: u64) {
         let cur_tick = GAME_TICK.lock().unwrap().tick;
-        if (cur_tick - tick) > 29 {
+        if (cur_tick - tick) >= (INPUT_SIZE - INPUT_DELAY) as u64 {
             panic!(
                 "Trying to restore state from the future tick : {}, ctick : {}",
                 tick, cur_tick
             );
         }
 
-        let index = 29 - (cur_tick - tick) as usize;
+        let index = (INPUT_SIZE - 1) - (cur_tick - tick) as usize;
 
-        if let Some(state) = self.rollback_states[index] {
+        if let Some(state) = self.rollback_states[index - INPUT_DELAY] {
             self.base_mut().set_position(state.position);
             self.vel = state.velocity;
             self.attack_cooldown = state.attack_cooldown;
@@ -194,12 +221,17 @@ impl Player {
 
         let current_pos = self.base().get_position();
 
-        let can_jump = current_pos.y == 65.0 && self.attack_cooldown <= 0.5;
-        let can_attack = self.attack_cooldown <= 0.0;
-
         let is_hit = self.anim_data.as_ref().unwrap().name == "hit".into();
         let is_die = self.anim_data.as_ref().unwrap().name == "die".into();
-        
+        let is_roll = self.anim_data.as_ref().unwrap().name == "roll".into();
+        let is_guard = self.anim_data.as_ref().unwrap().name == "guard".into();
+
+        let can_jump = current_pos.y == 65.0 && self.attack_cooldown <= 0.5;
+        let can_roll = current_pos.y == 65.0 && self.attack_cooldown <= 0.5 && !is_hit && !is_roll;
+        let can_guard = current_pos.y == 65.0 && self.attack_cooldown <= 0.5;
+        let can_attack = self.attack_cooldown <= 0.0 && !is_hit;
+
+
         if is_die || cur_tick == 0 {
             self.animate(tick);
             self.gui_update();
@@ -216,6 +248,8 @@ impl Player {
 
         let mut jump = false;
         let mut attack = false;
+        let mut roll = false;
+        let mut guard = false;
 
         let mut dir = 0;
         if cur_tick > 0 {
@@ -226,12 +260,16 @@ impl Player {
 
             jump = input & 0b0100 == 0b0100;
             attack = input & 0b1000 == 0b1000;
+            roll = (input & 0b10000 == 0b10000);
+            guard = (input & 0b100000 == 0b100000);
         } else {
             let input = input_controller.bind().local_input;
             dir += (input & 0b0001 == 0b0001) as i32;
             dir -= (input & 0b0010 == 0b0010) as i32;
             jump = input & 0b0100 == 0b0100;
             attack = input & 0b1000 == 0b1000;
+            roll = (input & 0b10000 == 0b10000);
+            guard = (input & 0b100000 == 0b100000);
         }
 
         if jump && can_jump {
@@ -250,7 +288,22 @@ impl Player {
                 looped: false,
             });
         }
+        if roll && can_roll {
+            self.anim_data = Some(PlayAnimationData {
+                name: "roll".into(),
+                started_at: tick,
+                looped: false,
+            });
+        }
+        if guard && can_guard {
+            self.anim_data = Some(PlayAnimationData {
+                name: "guard".into(),
+                started_at: tick,
+                looped: false,
+            });
+        }
         
+        let mut roll_delta = 1.0f32; 
 
         if self.attack_cooldown <= 0.5 {
             match self.anim_data.clone().unwrap().name {
@@ -303,6 +356,37 @@ impl Player {
                 EAnim::Hit => {
                     
                 }
+                EAnim::Attack2 => {
+                    
+                }
+                EAnim::Guard => {
+                    
+                }
+                EAnim::Roll => {
+                    let anim = self.anim_data.clone().unwrap();
+                    let frame = anim.clac_fream(tick, self.animation_player.clone().unwrap());
+
+                    dir = self.animation_player.clone().unwrap().get_scale().x.signum() as i32;
+                    match frame {
+                        0..=1 => {
+                            roll_delta = 0.0;
+                        }
+                        2..=3 => {
+                            roll_delta = 5.0;
+                        }
+                        4..=6 => {
+                            roll_delta = 1.5;
+                        }
+                        7..=9 => {
+                            roll_delta = 0.3;
+                        }
+                        _ => {
+                            // 프레임이 0에서 2 사이가 아닌 경우에 대한 처리
+                        }
+                    }
+
+                    godot_print!("frame: {}", frame);
+                }
             }
         }
 
@@ -313,7 +397,7 @@ impl Player {
         } as f64
             * (delta.sign());
 
-        let can_move = if !is_hit && self.attack_cooldown <= 0.5 {
+        let can_move = if !is_hit && self.attack_cooldown <= 0.5 && !is_guard {
             1.0
         } else {
             0.0
@@ -321,7 +405,7 @@ impl Player {
 
         velocity.x = move_toward(
             velocity.x as f64,
-            (dir as f32 * MAX_SPEED) as f64,
+            (dir as f32 * MAX_SPEED * roll_delta) as f64,
             delta.abs() * acc,
         ) as f32
             * can_move;
@@ -332,6 +416,8 @@ impl Player {
 
         let mut new_position = current_pos + velocity;
         new_position.y = new_position.y.min(65.0);
+        new_position.x = new_position.x.max(-450.0).min(450.0);
+
         self.base_mut().set_position(new_position);
 
         self.attack_cooldown = (self.attack_cooldown - delta).max(0.0);
@@ -345,7 +431,7 @@ impl Player {
 
         self.vel = velocity;
         let (changed, frame) = self.animate(tick);
-
+        
         let mut rt :Vec<EActionMessage> = vec![];
 
         if self.anim_data.as_ref().unwrap().name == "attack".into() && frame == 4 && changed {
@@ -366,6 +452,18 @@ impl Player {
                 effect.set_position(other_pos);
             }
         } else if self.anim_data.as_ref().unwrap().name == "hit".into() && frame == 6 && changed {
+            self.anim_data = Some(PlayAnimationData {
+                name: "idle".into(),
+                started_at: tick,
+                looped: true,
+            });
+        } else if self.anim_data.as_ref().unwrap().name == "roll".into() && frame == 9 && changed {
+            self.anim_data = Some(PlayAnimationData {
+                name: "idle".into(),
+                started_at: tick,
+                looped: true,
+            });
+        } else if self.anim_data.as_ref().unwrap().name == "guard".into() && frame == 6 && changed {
             self.anim_data = Some(PlayAnimationData {
                 name: "idle".into(),
                 started_at: tick,
@@ -419,6 +517,10 @@ impl Player {
         );
     }
 
+    pub fn is_gaurd(&self) -> bool {
+        return self.anim_data.as_ref().unwrap().name == "guard".into();
+    }
+
     pub fn gui_update(&mut self) {
         let mut player_health = self.base().get_node_as::<ProgressBar>("ProgressBar");
         player_health.set_value(self.stat.health);
@@ -430,9 +532,11 @@ impl INode2D for Player {
     fn init(base: Base<Node2D>) -> Self {
         Self {
             id: None,
-            real_inputs: [None; 30],
-            predicted_inputs: [0; 30],
-            rollback_states: [None; 30],
+            input: GameInput {
+                real_inputs: [None; INPUT_SIZE],
+                predicted_inputs: [0; INPUT_SIZE],
+            },
+            rollback_states: [None; INPUT_SIZE - INPUT_DELAY],
             attack_cooldown: 0.0,
             anim_data: None,
             stat: PlayerStat { health: 100.0 },

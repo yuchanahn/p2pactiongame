@@ -3,27 +3,34 @@ use std::clone;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::net::UdpSocket;
 use std::ops::Deref;
+use std::os::windows::raw::SOCKET;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use godot::engine::INode2D;
 use godot::engine::Node2D;
 use godot::engine::RandomNumberGenerator;
+use godot::engine::Window;
 use godot::prelude::*;
 
 use crate::game_manager::GameTick;
 use crate::game_manager::GAME_TICK;
 use crate::gui_player_state::GUIPlayerState;
+use crate::input_controller::INPUT_DELAY;
+use crate::input_controller::INPUT_SIZE;
 use crate::player::EActionMessage;
 use crate::player::PlayAnimationData;
 use crate::player::Player;
 use crate::time;
 use crate::udp_net;
+use crate::udp_net::pack;
 use crate::udp_net::Connect;
 use crate::udp_net::InputOKPacket;
 use crate::udp_net::TimeSync;
-use crate::udp_net::{send_bytes, unpack, PacketType, Ping, Pong};
+use crate::udp_net::{send_bytes, unpack, PacketType, Ping, Pong, Endpoint};
+use crate::utils::minus;
 use crate::utils::plus;
 
 use lazy_static::lazy_static;
@@ -55,6 +62,11 @@ pub struct NetworkController {
     thread: Option<std::thread::JoinHandle<()>>,
     pub send_buffer: Vec<Vec<u8>>,
     pub log_for_debug: Option<String>,
+    pub time_out1 : u64,
+    pub time_out2 : u64,
+    pub time_out3 : u64,
+    pub peer_addr: Option<Endpoint>,
+    pub peer_endpoint: Option<SocketAddr>,
     base: Base<Node2D>,
 }
 
@@ -89,7 +101,47 @@ impl NetworkController {
         let net_data = self.net.as_ref().unwrap();
         send_bytes(net_data.socket.as_ref(), packet, endpoint);
     }
+    
+    pub fn connect_to_server(&mut self) {
+        let mut sock = self.net.as_mut().unwrap().socket.as_ref().unwrap();
+        let local_addr = sock.local_addr().unwrap();
+        let mut packet = pack::<SocketAddr>(&local_addr, PacketType::RegisterEndpoint);
+        packet.insert(0, (packet.len() + 1) as u8);
+        send_bytes(Some(&sock), &packet, "13.124.53.124:55555");
+    }
 }
+
+
+pub fn connect_process(root_node: Gd<Window>, sock: Option<&UdpSocket>, target_addr: SocketAddr) {
+    let mut player = root_node.get_node_as::<Node2D>("Root/Player");
+    let pos = player.get_position();
+    
+    player.set_position(Vector2::new(393.0, pos.y));
+
+    let game_start_time = time::get_ms_timestamp() + 3000;
+    let mut game_tick = root_node.get_node_as::<GameTick>("Root/GameTick");
+    game_tick.bind_mut().game_start_time = game_start_time;
+
+    let mut packet = udp_net::pack::<Connect>(&Connect { x: 393.0, y: pos.y, game_start_time }, PacketType::Connect);
+    packet.insert(0, (packet.len() + 1) as u8);
+    
+    *TIME_BASED.lock().unwrap() = true;
+    *TIMESTAMP_FOR_TIMESYNC.lock().unwrap() = time::get_ms_timestamp();
+    drop(TIMESTAMP_FOR_TIMESYNC.lock().unwrap());
+    drop(TIME_BASED.lock().unwrap());
+    
+    let pkt: TimeSync = TimeSync { time: time::get_ms_timestamp() };
+    let mut pkt = udp_net::pack::<TimeSync>(&pkt, PacketType::TimeSync);
+    pkt.insert(0, (pkt .len() + 1) as u8);
+
+    let ep = target_addr.to_string();
+
+    send_bytes(sock, pkt.as_slice(), ep.as_str());
+    send_bytes(sock, packet.as_slice(), ep.as_str());
+}
+
+
+
 
 #[godot_api]
 impl INode2D for NetworkController {
@@ -102,18 +154,25 @@ impl INode2D for NetworkController {
             thread: None,
             send_buffer: Vec::new(),
             log_for_debug: None,
+            time_out1: 0,
+            time_out2: 0,
+            time_out3: 0,
+            peer_addr: None,
+            peer_endpoint: None,
             base,
         }
     }
 
     fn ready(&mut self) {
-        let rand = Gd::<RandomNumberGenerator>::default();
-
-        //let port = 55555;
-        let port = 5000 + (rand.clone().randi_range(50000, 60000));
-
-        let socket = udp_net::start_udp(port as u16).expect("Failed to start UDP");
+        let socket = udp_net::start_udp(0).expect("Failed to start UDP");
+        socket.connect("13.124.53.124:55555").expect("connect function failed");
+        let port = socket.local_addr().unwrap().port() as i32;
         let socket_for_thread = socket.try_clone();
+
+        
+
+        godot_print!("UDP on : {} | {}", socket.peer_addr().unwrap(), socket.local_addr().unwrap());
+
         self.net = Some(NetData {
             socket: Some(socket),
             network_latency: 0,
@@ -237,6 +296,56 @@ impl INode2D for NetworkController {
                 godot_print!("Sent ping packet : {}", ping.id);
             }
         }
+        
+        if let Some(peer) = self.peer_addr.as_ref() {
+            if (self.time_out1 != 0) && (self.time_out1 < timestamp) && self.peer_endpoint.is_none() {
+
+                godot_print!("HolePunch packet send to : {}", peer.addr);
+
+                let mut packet = pack::<u8>(&1, PacketType::HolePunch);
+                packet.insert(0, (packet.len() + 1) as u8);
+
+                let sock = net_data.socket.as_ref();
+
+                sock.unwrap().connect(peer.addr).expect("Failed to connect");
+                send_bytes(sock, &packet, peer.addr.to_string().as_str());
+
+                self.time_out1 = 0;
+                self.time_out2 = timestamp + 1000;
+            }
+            if (self.time_out2 != 0) && self.time_out2 < timestamp && self.peer_endpoint.is_none() {
+                godot_print!("HolePunch packet send2 to : {}", peer.addr);
+
+                let mut packet = pack::<u8>(&1, PacketType::HolePunch);
+                packet.insert(0, (packet.len() + 1) as u8);
+
+                let sock = net_data.socket.as_ref();
+
+                sock.unwrap().connect(peer.addr).expect("Failed to connect");
+                send_bytes(sock, &packet, peer.addr.to_string().as_str());
+
+                //now relay server mode...
+                self.time_out2 = 0;
+                self.time_out3 = timestamp + 1000;
+            }
+            if self.time_out3 != 0 && self.time_out3 < timestamp && self.peer_endpoint.is_none() {
+                godot_print!("Relay Server Start : {}", peer.addr);
+
+                self.peer_endpoint = "13.124.53.124:55555".parse().ok();
+                
+                net_data.socket.as_ref().unwrap().connect("13.124.53.124:55555").expect("connect function failed");
+
+                
+                let connect_packet_send = peer.addr.port() > net_data.socket.as_ref().unwrap().local_addr().unwrap().port();
+                if connect_packet_send {
+                connect_process(
+                    root_node.clone(), 
+                    net_data.socket.as_ref(), 
+                    self.peer_endpoint.unwrap());
+                }
+                self.time_out3 = 0;
+            }
+        }
 
         let mut raw = RAW_PACKETS.lock().unwrap();
 
@@ -333,61 +442,34 @@ impl INode2D for NetworkController {
                                 *last_tick = input.tick;
                             }
 
-                            if cur_tick < input.tick {
-                                let delta_tick = (input.tick - cur_tick) as usize;
-
-                                if delta_tick > 30 {
-                                    godot_print!("delta time : {}", delta);
-                                    godot_print!(
-                                        "Delta Tick is too big : {}({}/{})",
-                                        delta_tick,
-                                        cur_tick,
-                                        input.tick
-                                    );
-
-                                    continue;
-                                }
-
-                                let mut now_input = input.inputs.clone();
-                                for i in 0..delta_tick {
-                                    now_input[i] = other_player.predicted_inputs[i];
-                                }
-                                for i in delta_tick..30 {
-                                    now_input[i] = input.inputs[i - delta_tick];
-                                }
-                                input.tick = cur_tick;
-                                input.inputs = now_input;
-                            }
-
-                            let delta_tick = (cur_tick - input.tick) as usize;
-                            let offset = 30 - delta_tick;
+                            let delta_tick = minus(cur_tick, input.tick) as i32;
+                            let offset = INPUT_SIZE as i32 - delta_tick;
 
                             let mut rollback_tick: Option<u64> = None;
 
                             for i in 0..offset {
-                                other_player.real_inputs[i] = Some(input.inputs[i + delta_tick]);
+                                other_player.input.real_inputs[i as usize] = Some(input.inputs[(i + delta_tick) as usize]);
                             }
-                            for i in offset..30 {
-                                other_player.real_inputs[i] = None;
+                            for i in offset..INPUT_SIZE as i32 {
+                                other_player.input.real_inputs[i as usize] = None;
                             }
-                            for i in 0..offset {
-                                if other_player.predicted_inputs[i]
-                                    != other_player.real_inputs[i].unwrap()
+                            for i in 0..(offset - INPUT_DELAY as i32){
+                                if other_player.input.predicted_inputs[i as usize]
+                                    != other_player.input.real_inputs[i as usize].unwrap()
                                 {
                                     rollback_tick = Some(input.tick - (offset - i) as u64);
                                     break;
                                 }
                             }
 
-                            let pred = other_player.real_inputs[offset - 1].unwrap();
-                            other_player.predicted_inputs =
-                                other_player.real_inputs.clone().map(|x| x.unwrap_or(pred));
+                            let pred = other_player.input.real_inputs[(offset - 1) as usize].unwrap();
+                            other_player.input.predicted_inputs = other_player.input.real_inputs.clone().map(|x| x.unwrap_or(pred));
 
                             if let Some(rollback_tick) = rollback_tick {
                                 other_player.show_rollback_text();
                                 //최종 롤백 상태로 복구
                                 other_player.restore_state(rollback_tick - 1);
-                                other_player.rollback_states = [None; 30];
+                                other_player.rollback_states = [None; INPUT_SIZE - INPUT_DELAY];
                                 let mut player = player.clone();
                                 let mut local_player = player.bind_mut();
 
@@ -450,6 +532,52 @@ impl INode2D for NetworkController {
                         }
                     }
                     PacketType::InputOK => {}
+                    PacketType::GetEndpoint => {
+                        let (ep, _) = unpack::<Endpoint>(&buffer[1..]).unwrap();
+
+                        let mut packet = pack::<u8>(&0, PacketType::HolePunch);
+                        packet.insert(0, (packet.len() + 1) as u8);
+                        let sock = net_data.socket.as_ref();
+                        sock.unwrap().connect(ep.local_addr).expect("Failed to connect");
+                        send_bytes(sock, &packet, ep.local_addr.to_string().as_str());
+
+                        godot_print!("GetEndpoint packet received : {}", ep.local_addr);
+
+                        self.peer_addr = Some(ep.clone());
+                        self.time_out1 = timestamp + 3000;
+                    }
+                    PacketType::HolePunch => {
+                        godot_print!("HolePunch packet received");
+                        if self.peer_endpoint.is_some() {
+                            continue;
+                        }
+                        if let Some(peer) = self.peer_addr.as_ref() {
+                            let (type_of_addr, _) = unpack::<u8>(&buffer[1..]).unwrap();
+
+                            let mut connect_packet_send = false;
+
+                            if type_of_addr == 0 {
+                                self.peer_endpoint = Some(peer.local_addr);
+                                connect_packet_send = peer.local_addr.port() > net_data.my_port as u16;
+                            } else {
+                                self.peer_endpoint = Some(peer.addr);
+                                connect_packet_send = peer.addr.port() > net_data.socket.as_ref().unwrap().local_addr().unwrap().port();
+                            }
+
+                            let mut packet = pack::<u8>(if type_of_addr == 0 { &0 } else { &1 }, PacketType::HolePunch);
+                            packet.insert(0, (packet.len() + 1) as u8);
+                            send_bytes(net_data.socket.as_ref(), &packet, addr.to_string().as_str());
+
+                            if connect_packet_send {
+                                connect_process(
+                                    root_node.clone(), 
+                                    net_data.socket.as_ref(), 
+                                    self.peer_endpoint.unwrap());
+
+                                godot_print!("Connected to : {}", self.peer_endpoint.unwrap());
+                            };
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -458,12 +586,12 @@ impl INode2D for NetworkController {
         if let Some(other_player) = other_player.as_mut() {
             let mut other_player = other_player.bind_mut();
 
-            let predicted_input = other_player.predicted_inputs.last().unwrap().clone();
-            let len = other_player.predicted_inputs.len();
+            let predicted_input = other_player.input.predicted_inputs.last().unwrap().clone();
+            let len = other_player.input.predicted_inputs.len();
             for i in 1..len {
-                other_player.predicted_inputs[i - 1] = other_player.predicted_inputs[i];
+                other_player.input.predicted_inputs[i - 1] = other_player.input.predicted_inputs[i];
             }
-            other_player.predicted_inputs[len - 1] = predicted_input;
+            other_player.input.predicted_inputs[len - 1] = predicted_input;
 
             let actions = other_player.simulated_tick(player.clone(), cur_tick, delta);
 
@@ -489,7 +617,7 @@ impl INode2D for NetworkController {
             }
 
             other_player.push_rollback_state(cur_tick);
-            for i in 0..29 {
+            for i in 0..INPUT_SIZE - INPUT_DELAY - 1{
                 other_player.rollback_states[i] = other_player.rollback_states[i + 1];
             }
 
@@ -519,7 +647,7 @@ impl INode2D for NetworkController {
             }
 
             local_player.push_rollback_state(cur_tick);
-            for i in 0..29 {
+            for i in 0..INPUT_SIZE - INPUT_DELAY - 1 {
                 local_player.rollback_states[i] = local_player.rollback_states[i + 1];
             }
         }

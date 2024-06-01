@@ -16,3 +16,4 @@ mod game_manager;
 mod shape_cast2d;
 mod effect;
 mod utils;
+mod main_menu;

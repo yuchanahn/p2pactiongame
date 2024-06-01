@@ -10,6 +10,15 @@ use crate::udp_net::pack;
 use crate::udp_net::InputPacket;
 use crate::udp_net::PacketType;
 
+pub const INPUT_SIZE: usize = 30;
+pub const INPUT_DELAY: usize = 3;
+
+#[derive(Debug, Clone, Copy)]
+pub struct GameInput {
+    pub real_inputs: [Option<u8>; INPUT_SIZE],
+    pub predicted_inputs: [u8; INPUT_SIZE],
+}
+
 #[derive(GodotClass)]
 #[class(base=Node2D)]
 pub struct InputController {
@@ -78,6 +87,14 @@ impl INode2D for InputController {
             input2send |= 0b1000;
             key_str.push_str("mouse1");
         }
+        if input.is_action_pressed("roll".into()) {
+            input2send |= 0b10000;
+            key_str.push_str("shift");
+        }
+        if input.is_action_pressed("guard".into()) {
+            input2send |= 0b100000;
+            key_str.push_str("mouse2");
+        }
 
         self.gui_text_keypress
             .as_mut()
@@ -95,11 +112,16 @@ impl INode2D for InputController {
             return;
         }
         
-        local_player.bind_mut().push_input(input2send);
-        let inputs = local_player.bind_mut().real_inputs.clone().map(|x| x.unwrap_or(0));
-        
+        let mut local_player = local_player.bind_mut();
+        let mut inputs = local_player.input.clone();
+        for i in 0..INPUT_SIZE - 1 {
+            inputs.real_inputs[i] = inputs.real_inputs[i + 1];
+        }
+        inputs.real_inputs[INPUT_SIZE - 1] = Some(input2send);
+        local_player.input = inputs;
+
         let input_packet = InputPacket {
-            inputs: inputs.try_into().unwrap(),
+            inputs: local_player.input.real_inputs.clone().map(|x| x.unwrap_or(0)).try_into().unwrap(),
             tick: tick,
         };
 

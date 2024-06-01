@@ -1,5 +1,5 @@
 use std::mem;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::io;
 
 use godot::log::godot_print;
@@ -13,7 +13,11 @@ pub enum PacketType {
     Connect,
     Input,
     InputOK,
-    TimeSync
+    TimeSync,
+    RegisterEndpoint = 200,
+    GetEndpoint = 201,
+    HolePunch = 202,
+    TestChat = 203,
 }
 
 impl From<u8> for PacketType {
@@ -25,11 +29,21 @@ impl From<u8> for PacketType {
             3 => PacketType::Input,
             4 => PacketType::InputOK,
             5 => PacketType::TimeSync,
+            200 => PacketType::RegisterEndpoint,
+            201 => PacketType::GetEndpoint,
+            202 => PacketType::HolePunch,
+            203 => PacketType::TestChat,
             _ => panic!("Unknown packet type")
         }
     }
 }
 
+
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    pub addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
 
 pub struct Ping {
     pub id: u8
@@ -67,6 +81,7 @@ pub enum UnpackError {
 pub fn unpack<T>(data: &[u8]) -> Result<(T, u32), UnpackError>
 {
     if data.len() < mem::size_of::<T>() {
+        godot_print!("Invalid size : {} < {}", data.len(), mem::size_of::<T>());
         return Err(UnpackError::InvalidSize);
     }
 
@@ -92,8 +107,7 @@ pub fn pack<T>(data: &T, packet_type: PacketType) -> Vec<u8> {
 }
 
 pub fn start_udp(port: u16) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port))?;
-    godot_print!("UDP socket started on port {}", port);
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind to port");
     //socket.set_nonblocking(true)?;
     Ok(socket)
 }
