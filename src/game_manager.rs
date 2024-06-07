@@ -56,12 +56,8 @@ impl INode2D for GameTick {
             }
             return;
         }
-
+        
         let mut tick = GAME_TICK.lock().unwrap();
-
-        if tick.tick == 0 {
-            tick.tick = 30;
-        }
         tick.tick += 1;
     }
 }
