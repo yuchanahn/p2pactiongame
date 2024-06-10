@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 
-use godot::{builtin::{math::FloatExt, StringName, Vector2}, engine::{input, utilities::{minf, move_toward}, AnimatedSprite2D}, log::godot_print, obj::Gd};
+use godot::{builtin::{math::{self, FloatExt}, StringName, Vector2}, engine::{input, utilities::{minf, move_toward, rand_from_seed}, AnimatedSprite2D}, log::godot_print, obj::Gd};
 
-use crate::{animation_controller::{EAnim, PlayAnimationData}, player::*, utils::minus};
+use crate::{animation_controller::{EAnim, PlayAnimationData}, col2d::{circle_cast, Box2D, Circle2D, Collision2D}, game_manager::GameTick, player::*, random, utils::minus};
 
 #[derive(Clone)]
 pub struct WorldData {
     pub players: HashMap<u64, PlayerData>,
+    pub collision: Vec<Collision2D>,
 }
 
 #[derive(Clone)]
 pub struct PlayerData {
+    pub id: u64,
     pub pos: Vector2,
     pub vel: Vector2,
     pub attack_cooldown: f64,
@@ -19,7 +21,20 @@ pub struct PlayerData {
     pub object: Option<Gd<Player>>
 }
 
-fn simulate_player(mut data: PlayerData, input: u8, tick: u64, delta: f64) -> PlayerData {
+#[derive(Clone, Debug)]
+pub enum ActionMessage {
+    Attack(AmAttack),
+
+}
+
+#[derive(Clone, Debug)]
+pub struct AmAttack {
+    pub form: u64,
+    pub to: u64,
+    pub damage: f64,
+}
+
+fn simulate_player(mut data: PlayerData, col_world: &Vec<Collision2D>, input: u8, tick: u64, delta: f64) -> (PlayerData, Option<ActionMessage>, Vec<Collision2D>) {
     let current_anim = data.clone().anim_data.as_ref().unwrap().name;
 
     let is_hit = current_anim == "hit".into();
@@ -39,7 +54,7 @@ fn simulate_player(mut data: PlayerData, input: u8, tick: u64, delta: f64) -> Pl
     if is_die || tick == 0 {
         animate(data.anim_data.unwrap(), anim_player.clone(), tick);
         player_object.bind_mut().gui_update();
-        return data.clone();
+        return (data.clone(), None, col_world.clone());
     }
 
     let mut dir = 0;
@@ -200,6 +215,26 @@ fn simulate_player(mut data: PlayerData, input: u8, tick: u64, delta: f64) -> Pl
     data.pos = new_position;
 
     data.attack_cooldown = (data.attack_cooldown - delta).max(0.0);
+    
+    let mut new_col_world = vec![];
+
+    for col_ori in col_world {
+        match col_ori {
+            Collision2D::Box(col) => {
+                if col.owner_id == data.id {
+                    new_col_world.push(Collision2D::Box(Box2D {
+                        owner_id: data.id,
+                        pos: data.pos,
+                        size: Vector2::new(50.0, 50.0),
+                    }));
+                }
+                else {
+                    new_col_world.push(col_ori.clone());
+                }
+            }
+            _ => {}
+        }
+    }
 
     if data.vel.x != 0.0 {
         anim_player
@@ -207,13 +242,37 @@ fn simulate_player(mut data: PlayerData, input: u8, tick: u64, delta: f64) -> Pl
             .set_scale(Vector2::new(data.vel.x.signum(), 1.0) * 0.2);
     }
     
+    let anim_dir = anim_player.clone().get_scale().x.signum() as i32;
     let (changed, frame) = animate(data.anim_data.unwrap(), anim_player, tick);
-    
-    if current_anim == "attack".into() && frame == 4 && changed {
-        //TODO: 충돌체 만들고 나중에 충돌처리 해야지!
-        // 판정 같은 것도 나중에 처리합시다. 이렇게 하면 구르기나 가드도 판정이 가능합니다.
 
-        godot_print!(" ----- TODO: Attack! ----- ");
+    let mut action = None;
+
+    if current_anim == "attack".into() && frame == 4 && changed {
+        let attack_range = Circle2D {
+            owner_id: data.id,
+            pos: data.pos + Vector2::new(75.0 * anim_dir as f32, 0.0),
+            radius: 55.0,
+        };
+
+        godot_print!("attack range : {:?}", attack_range);
+
+        circle_cast(col_world, &attack_range).iter().for_each(|col| {
+            match col {
+                Collision2D::Box(col) => {
+                    godot_print!("attack collision : {:?}", col);
+                    if data.id != col.owner_id {
+                        let seed = (tick % 100000) as i64; 
+                        let damage = random::Rand::new(seed as u32).rand_range(10, 20);
+                        action = Some(ActionMessage::Attack(AmAttack {
+                            form: data.id,
+                            to: col.owner_id,
+                            damage: damage as f64,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        });
     } else if current_anim == "hit".into() && frame == 6 && changed {
         data.anim_data = Some(PlayAnimationData {
             name: "idle".into(),
@@ -234,7 +293,7 @@ fn simulate_player(mut data: PlayerData, input: u8, tick: u64, delta: f64) -> Pl
         });
     }
 
-    data
+    (data, action, new_col_world)
 }
 
 pub fn animate(anim_data: PlayAnimationData, anim_player: Gd<AnimatedSprite2D>, tick: u64) -> (bool, i32) {
@@ -272,24 +331,64 @@ pub fn animate(anim_data: PlayAnimationData, anim_player: Gd<AnimatedSprite2D>, 
     );
 }
 
-pub fn simulate_world(mut world_data: WorldData, input_data: HashMap<u64, u8>, tick: u64) -> WorldData {
-    for (id, player) in world_data.players.iter_mut() {
-        let new_data = simulate_player(player.clone(), input_data[id], tick, 1.0 / 60.0);
-        *player = new_data;
+pub fn action_process(actions: Vec<ActionMessage>, world_data: &mut WorldData, tick: u64) {
+    for action in actions {
+        match action {
+            ActionMessage::Attack(attack) => {
+                let target = world_data.players.get_mut(&attack.to).unwrap();
+                target.health -= attack.damage;
+                if target.health <= 0.0 {
+                    target.anim_data = Some(PlayAnimationData {
+                        name: "die".into(),
+                        started_at: tick,
+                        looped: false,
+                    });
+                } else {
+                    target.anim_data = Some(PlayAnimationData {
+                        name: "hit".into(),
+                        started_at: tick,
+                        looped: false,
+                    });
+                }
+            }
+        }
     }
+}
+
+pub fn simulate_world(mut world_data: WorldData, input_data: HashMap<u64, u8>, tick: u64) -> WorldData {
+    let mut actions = Vec::new();
+
+    for (id, player) in world_data.players.iter_mut() {
+        let (new_data, action, cols) = simulate_player(player.clone(), &world_data.collision, input_data[id], tick, 1.0 / 60.0);
+        *player = new_data;
+        world_data.collision = cols;
+        if let Some(action) = action {
+            actions.push(action);
+        }
+    }
+
+    action_process(actions, &mut world_data, tick);
+
     world_data
 }
 
-pub fn simulate_world_range(mut world_data: WorldData, input_data: HashMap<u64, HashMap<u64, u8>>, start_tick: u64, end_tick: u64, real_input_tick: u64) -> (WorldData, HashMap<u64, WorldData>) {
+pub fn simulate_world_range(mut world_data: WorldData, input_data: HashMap<u64, HashMap<u64, u8>>, start_tick: u64, end_tick: u64, real_input_tick: u64)
+ -> (WorldData, HashMap<u64, WorldData>) {
     let mut snapshot = HashMap::new();
     for tick in start_tick..end_tick {
-        if tick >= real_input_tick {
+        if tick > real_input_tick {
             snapshot.insert(tick, world_data.clone());
         }
         for (id, input) in input_data.iter() {
             let player = world_data.players.get_mut(id).unwrap();
-            let new_data = simulate_player(player.clone(), input[&tick], tick, 1.0 / 60.0);
+            let (new_data, action, cols) = simulate_player(player.clone(), &world_data.collision, input[&tick], tick, 1.0 / 60.0);
+            
+            world_data.collision = cols;
             world_data.players.insert(*id, new_data);
+
+            if let Some(action) = action {
+                action_process(vec![action], &mut world_data, tick);
+            }
         }
     }
     (world_data, snapshot)

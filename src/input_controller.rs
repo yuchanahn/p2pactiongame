@@ -116,3 +116,27 @@ impl INode2D for InputController {
         nc.send_buffer.push(packet);
     }
 }
+
+
+pub fn input_to_str(input: u8) -> String {
+    let mut s = "".to_string();
+    if input & 0b0001 != 0 {
+        s.push_str("d");
+    }
+    if input & 0b0010 != 0 {
+        s.push_str("a");
+    }
+    if input & 0b0100 != 0 {
+        s.push_str("w");
+    }
+    if input & 0b1000 != 0 {
+        s.push_str("mouse1");
+    }
+    if input & 0b10000 != 0 {
+        s.push_str("shift");
+    }
+    if input & 0b100000 != 0 {
+        s.push_str("mouse2");
+    }
+    s
+}

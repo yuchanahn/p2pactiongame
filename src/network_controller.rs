@@ -5,16 +5,21 @@ use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::sync::Mutex;
 
+use godot::engine::class_db;
 use godot::engine::INode2D;
 use godot::engine::Node2D;
 use godot::engine::Window;
 use godot::prelude::*;
 
 use crate::animation_controller::PlayAnimationData;
+use crate::col2d::Box2D;
+use crate::col2d::Circle2D;
+use crate::col2d::Collision2D;
 use crate::game_manager::GameTick;
 use crate::game_manager::GAME_TICK;
 use crate::gui_player_state::GUIPlayerState;
 use crate::input_controller;
+use crate::input_controller::input_to_str;
 use crate::input_controller::INPUT_SIZE;
 use crate::player::Player;
 use crate::time;
@@ -172,7 +177,15 @@ impl NetworkController {
             current_inputs.insert(*k, v[&cur_tick]);
         }
 
+        let pinput = current_inputs.clone();
         self.world = simulate_world(self.world.clone(), current_inputs, cur_tick);
+
+        for (k, v) in self.world.players.iter() {
+            if let Some(mut obj) = v.object.clone() {
+                obj.bind_mut().show_input_text(&format!("{:?}", input_to_str(pinput[k])));
+            }
+        }
+
         update_all_player_gd(&mut self.world);
     }
 }
@@ -197,6 +210,7 @@ impl INode2D for NetworkController {
             world_snapshot: HashMap::new(),
             world: WorldData {
                 players: HashMap::new(),
+                collision: Vec::new(),
             },
             base,
         }
@@ -226,9 +240,11 @@ impl INode2D for NetworkController {
         let root_node = self.base().get_tree().unwrap().get_root().unwrap();
         let my_player = root_node.get_node_as::<Player>("Root/Player");
 
+        let player_position = Vector2::new(-300.0, 65.0);
         self.world.players.insert(port as u64, 
         PlayerData {
-            pos: Vector2::new(-300.0, 65.0),
+            id: port as u64,
+            pos: player_position,
             vel: Vector2::new(0.0, 0.0),
             attack_cooldown: 0.0,
             health: 100.0,
@@ -481,6 +497,7 @@ impl INode2D for NetworkController {
                             let other_player_id = self.peer_addr.as_ref().unwrap().addr.port() as u64;
                             self.world.players.insert(other_player_id, 
                             PlayerData {
+                                id: other_player_id,
                                 pos: Vector2::new(connect.x, connect.y),
                                 vel: Vector2::new(0.0, 0.0),
                                 attack_cooldown: 0.0,
@@ -493,6 +510,11 @@ impl INode2D for NetworkController {
                                 object: Some(other.clone()),
                             }
                             );
+                            self.world.collision.push(Collision2D::Box(Box2D{
+                                owner_id: other_player_id,
+                                pos: Vector2::new(connect.x - 5.0, connect.y),
+                                size: Vector2::new(52.0, 104.0),
+                            }));
                             self.player_input.insert(other_player_id, HashMap::new());
                             godot_print!("Other Player Connected : {}", other_player_id);
 
@@ -523,6 +545,11 @@ impl INode2D for NetworkController {
                         let mut my_player = self.world.players.get_mut(&(my_port as u64)).unwrap().clone();
                         my_player.pos = my_player.object.clone().unwrap().get_position();
                         self.world.players.insert(my_port as u64, my_player.clone());
+                        self.world.collision.push(Collision2D::Box(Box2D{
+                            owner_id: my_port as u64,
+                            pos: my_player.pos + Vector2::new(-5.0, 0.0),
+                            size: Vector2::new(52.0, 104.0),
+                        }));
                     }
                     PacketType::Input => {
                         let (input, _) =
@@ -533,7 +560,12 @@ impl INode2D for NetworkController {
                         }
 
                         let mut inputs = self.player_input.get(&(addr.port() as u64)).unwrap().clone();
-                        let input_start_tick = input.tick - (INPUT_SIZE - 1) as u64;
+                        let mut input_start_tick = 0;
+                        if input.tick < INPUT_SIZE as u64 {
+                            input_start_tick = 0;
+                        } else {
+                            input_start_tick = input.tick - (INPUT_SIZE - 1) as u64;
+                        }
                         let mut rollback_tick: Option<u64> = None;
 
                         for i in 0..min(cur_tick, INPUT_SIZE as u64) as usize {
@@ -546,7 +578,7 @@ impl INode2D for NetworkController {
                             inputs.insert(key, input.inputs[i]);
                         }
 
-                        for i in input.tick..(cur_tick-1) {
+                        for i in input.tick..cur_tick {
                             inputs.insert(i, input.inputs[29]);
                         }
 
@@ -559,6 +591,10 @@ impl INode2D for NetworkController {
                         if let Some(rollback_tick) = rollback_tick {
                             let mut other_player = root_node.get_node_as::<Player>("Root/OtherPlayer");
                             other_player.bind_mut().show_rollback_text();
+
+                            //debug
+                            godot_print!("{:?}", snapshot.keys());
+                            godot_print!("Rollback to : {}", rollback_tick);
 
                             let rollback_world = snapshot[&rollback_tick].clone();
 

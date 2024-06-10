@@ -48,6 +48,11 @@ impl Player {
         rollback_text.set_modulate(modulate);
     }
 
+    pub fn show_input_text(&mut self, in_input_text: &str) {
+        let mut input_text = self.base().get_node_as::<Label>("InputText");
+        input_text.set_text(in_input_text.into());
+    }
+
     pub fn gui_update(&mut self) {
         let mut player_health = self.base().get_node_as::<ProgressBar>("ProgressBar");
         //TODO: player_health.set_value(self.stat.health);
